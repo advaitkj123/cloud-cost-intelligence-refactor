@@ -41,3 +41,4 @@ class Resource(Base):
     cost_records = relationship("CostRecord", back_populates="resource", cascade="all, delete-orphan")
     anomalies = relationship("Anomaly", back_populates="resource", cascade="all, delete-orphan")
     actions = relationship("ActionLog", back_populates="resource", cascade="all, delete-orphan")
+    features = relationship("Feature", back_populates="resource", cascade="all, delete-orphan")

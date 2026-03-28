@@ -17,17 +17,45 @@ from app.db.repositories.cost_repository import CostRecordRepository
 from app.db.repositories.metric_repository import MetricRepository
 from app.db.repositories.resource_repository import ResourceRepository
 from app.db.session import SessionLocal, engine
-from app.models import actions, anomalies, cost, metrics, resource  # noqa: F401
+from app.models import actions, anomalies, cost, features, metrics, resource  # noqa: F401
 from app.services.anomaly_detector import AnomalyDetector
 from app.services.collector import CloudMetricCollector
+from app.services.data_pipeline import DataPipeline
 from app.services.inference_queue import initialize_inference_scheduler, shutdown_inference_scheduler, InferenceQueueService
+from app.services.ingestion_service import IngestionService
 from app.services.orchestrator import MetricOrchestrator
 from app.services.shap_explainer import ShapExplainer
+from app.services.anomaly_training import get_training_service
+from app.services.anomaly_service import AnomalyService
+from app.db.repositories.feature_repository import FeatureRepository
 
 settings = get_settings()
 setup_logging()
 
 scheduler = BackgroundScheduler(timezone="UTC")
+
+
+def run_ingestion_cycle() -> None:
+    """Run the AWS ingestion collection cycle."""
+    db = SessionLocal()
+    try:
+        if settings.cloud_collector_mode.lower() == "aws":
+            ingestion_service = IngestionService(db)
+            results = ingestion_service.run_ingestion_cycle(regions=[settings.aws_region])
+            logger.info(
+                "AWS ingestion cycle completed: %d metrics collected, "
+                "%d stored, %d errors",
+                results["total_metrics_collected"],
+                results["metrics_stored"],
+                len(results["errors"]),
+            )
+            if results["errors"]:
+                logger.warning("Ingestion errors: %s", results["errors"])
+    except Exception as exc:  # pragma: no cover - operational guardrail
+        db.rollback()
+        logger.exception("Ingestion cycle failed: %s", exc)
+    finally:
+        db.close()
 
 
 def run_collection_cycle() -> None:
@@ -65,12 +93,133 @@ def run_collection_cycle() -> None:
         db.close()
 
 
+def run_data_pipeline_cycle() -> None:
+    """Run the data pipeline: metrics → costs → features."""
+    db = SessionLocal()
+    try:
+        pipeline = DataPipeline(db)
+        results = pipeline.process_all_resources()
+        logger.info(
+            "Data pipeline cycle completed: %d resources processed, "
+            "%d costs, %d features, %d errors",
+            results["resources_processed"],
+            results["costs_calculated"],
+            results["features_engineered"],
+            len(results["errors"]),
+        )
+        if results["errors"]:
+            logger.warning("Pipeline errors: %s", results["errors"][:5])  # Log first 5
+    except Exception as exc:  # pragma: no cover - operational guardrail
+        db.rollback()
+        logger.exception("Data pipeline cycle failed: %s", exc)
+    finally:
+        db.close()
+
+
+def run_anomaly_detection_cycle() -> None:
+    """Run anomaly detection on all resources."""
+    db = SessionLocal()
+    try:
+        service = AnomalyService()
+        resource_repo = ResourceRepository(db)
+        feature_repo = FeatureRepository(db)
+        anomaly_repo = AnomalyRepository(db)
+        
+        resources = resource_repo.list_all()
+        detected_count = 0
+        errors = []
+        
+        for resource in resources:
+            try:
+                # Get latest feature for resource
+                latest_features = feature_repo.list_for_resource(resource.id, limit=1)
+                if not latest_features:
+                    continue
+                
+                feature = latest_features[0]
+                result = service.detect(db, resource, feature)
+                
+                if result.is_anomaly:
+                    detected_count += 1
+                    
+                    # Store anomaly in database
+                    from app.models.anomalies import Anomaly
+                    anomaly = Anomaly(
+                        resource_id=resource.id,
+                        is_anomaly=result.is_anomaly,
+                        confidence=result.confidence,
+                        anomaly_type=result.anomaly_type.value,
+                        isolation_forest_score=result.details["isolation_forest"].get("anomaly_score"),
+                        prophet_is_anomaly=result.details["prophet"].get("is_anomaly"),
+                        prophet_confidence=result.details["prophet"].get("confidence"),
+                        zombie_is_idle=result.details["zombie"].get("is_zombie"),
+                        zombie_confidence=result.details["zombie"].get("confidence"),
+                        cost_delta=feature.cost_delta,
+                        cpu_avg=feature.cpu_avg,
+                        efficiency_score=feature.efficiency_score,
+                        details=result.details,
+                        recommendations=service.get_recommendations(result, db),
+                        timestamp=result.timestamp,
+                    )
+                    anomaly_repo.create(anomaly)
+            except Exception as resource_error:
+                logger.warning("Error detecting anomaly for resource %s: %s", resource.id, resource_error)
+                errors.append(str(resource_error))
+        
+        logger.info(
+            "Anomaly detection cycle completed: %d resources processed, "
+            "%d anomalies detected, %d errors",
+            len(resources),
+            detected_count,
+            len(errors),
+        )
+        if errors:
+            logger.debug("Anomaly detection errors: %s", errors[:5])
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Anomaly detection cycle failed: %s", exc)
+    finally:
+        db.close()
+
+
+def run_anomaly_model_training() -> None:
+    """Run anomaly model training."""
+    db = SessionLocal()
+    try:
+        training_service = get_training_service()
+        results = training_service.train_all_models(db, days_back=30)
+        
+        logger.info(
+            "Anomaly model training completed: isolation_forest=%s, prophet=%s, zombie=%s",
+            results["models"].get("isolation_forest", {}).get("trained", False),
+            results["models"].get("prophet", {}).get("trained", False),
+            results["models"].get("zombie", {}).get("status", "unknown"),
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Anomaly model training failed: %s", exc)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     bootstrap_database(engine)
     initialize_inference_scheduler()
     if settings.scheduler_enabled and not scheduler.running:
+        # Add ingestion job if AWS mode is enabled
+        if settings.cloud_collector_mode.lower() == "aws":
+            scheduler.add_job(
+                run_ingestion_cycle,
+                trigger="interval",
+                seconds=settings.scheduler_interval_seconds,
+                id="aws-ingestion",
+                replace_existing=True,
+            )
+            logger.info("AWS ingestion job added to scheduler (interval: %ds)", settings.scheduler_interval_seconds)
+        
+        # Add collection cycle job
         scheduler.add_job(
             run_collection_cycle,
             trigger="interval",
@@ -78,6 +227,39 @@ async def lifespan(_: FastAPI):
             id="metric-collector",
             replace_existing=True,
         )
+        
+        # Add data pipeline job (runs after collection to process metrics)
+        pipeline_interval = max(settings.scheduler_interval_seconds * 2, 60)  # At least 1 minute
+        scheduler.add_job(
+            run_data_pipeline_cycle,
+            trigger="interval",
+            seconds=pipeline_interval,
+            id="data-pipeline",
+            replace_existing=True,
+        )
+        logger.info("Data pipeline job added to scheduler (interval: %ds)", pipeline_interval)
+        
+        # Add anomaly detection job (runs after data pipeline to detect anomalies)
+        anomaly_interval = max(settings.scheduler_interval_seconds * 4, 120)  # At least 2 minutes
+        scheduler.add_job(
+            run_anomaly_detection_cycle,
+            trigger="interval",
+            seconds=anomaly_interval,
+            id="anomaly-detection",
+            replace_existing=True,
+        )
+        logger.info("Anomaly detection job added to scheduler (interval: %ds)", anomaly_interval)
+        
+        # Add anomaly model training job (runs daily)
+        scheduler.add_job(
+            run_anomaly_model_training,
+            trigger="interval",
+            days=settings.anomaly_training_interval_days,
+            id="anomaly-training",
+            replace_existing=True,
+        )
+        logger.info("Anomaly model training job added to scheduler (interval: %d days)", settings.anomaly_training_interval_days)
+        
         scheduler.start()
         logger.info("Background scheduler started")
     yield

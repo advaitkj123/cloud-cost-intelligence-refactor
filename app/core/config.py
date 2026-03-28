@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     high_request_spike_multiplier: float = 3.0
     cost_threshold_for_stop: float = 1.0
 
+    # Model storage and configuration
+    model_storage_path: str = "./models"
+    anomaly_contamination: float = 0.1  # Fraction of data to consider as anomalies
+    prophet_interval_width: float = 0.95  # Confidence interval for Prophet
+    anomaly_training_interval_days: int = 1  # Train models daily
+    zombie_detector_enabled: bool = True
+    isolation_forest_enabled: bool = True
+    prophet_enabled: bool = True
+
     auto_apply_optimizations: bool = True
     dry_run_optimizations: bool = True
 

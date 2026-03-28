@@ -8,12 +8,16 @@ from sqlalchemy.orm import Session
 from app.db.repositories.action_repository import ActionRepository
 from app.db.repositories.anomaly_repository import AnomalyRepository
 from app.db.repositories.cost_repository import CostRecordRepository
+from app.db.repositories.feature_repository import FeatureRepository
 from app.db.repositories.metric_repository import MetricRepository
 from app.db.repositories.resource_repository import ResourceRepository
 from app.db.session import SessionLocal
+from app.ingestion.scheduler import IngestionScheduler
 from app.services.anomaly_detector import AnomalyDetector
 from app.services.collector import CloudMetricCollector
+from app.services.data_pipeline import DataPipeline
 from app.services.inference_queue import InferenceQueueService
+from app.services.ingestion_service import IngestionService
 from app.services.orchestrator import MetricOrchestrator
 from app.services.shap_explainer import ShapExplainer
 
@@ -36,6 +40,10 @@ def get_metric_repository(db: Session = Depends(get_db)) -> MetricRepository:
 
 def get_cost_repository(db: Session = Depends(get_db)) -> CostRecordRepository:
     return CostRecordRepository(db)
+
+
+def get_feature_repository(db: Session = Depends(get_db)) -> FeatureRepository:
+    return FeatureRepository(db)
 
 
 def get_anomaly_repository(db: Session = Depends(get_db)) -> AnomalyRepository:
@@ -87,3 +95,17 @@ def get_metric_orchestrator(
         anomaly_detector=anomaly_detector,
         inference_queue=inference_queue,
     )
+
+
+def get_ingestion_service(
+    db: Session = Depends(get_db),
+) -> IngestionService:
+    return IngestionService(db)
+
+
+def get_ingestion_scheduler() -> IngestionScheduler:
+    return IngestionScheduler()
+
+
+def get_data_pipeline(db: Session = Depends(get_db)) -> DataPipeline:
+    return DataPipeline(db)
