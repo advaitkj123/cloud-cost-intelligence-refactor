@@ -9,9 +9,16 @@ from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_db
 from app.services.data_pipeline import DataPipeline
+from app.services.pipeline_orchestrator import run_unified_pipeline
 from app.core.logger import logger
 
 router = APIRouter()
+
+
+@router.post("/pipeline/run-full")
+def run_full_backend_pipeline(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Run the full backend pipeline: ingestion through system health (see UnifiedPipelineOrchestrator)."""
+    return run_unified_pipeline(db)
 
 
 @router.post("/pipeline/process")
@@ -155,10 +162,16 @@ def get_pipeline_status() -> dict[str, Any]:
         "status": "operational",
         "version": "1.0.0",
         "pipeline_stages": [
-            "metrics_collection",
-            "cost_estimation",
+            "ingestion",
+            "cost_engine",
             "feature_engineering",
-            "storage",
+            "ml_detection",
+            "xai",
+            "simulation",
+            "decision",
+            "safety",
+            "execution",
+            "system_health",
         ],
         "supported_features": [
             "cost_delta",

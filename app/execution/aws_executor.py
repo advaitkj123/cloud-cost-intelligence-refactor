@@ -28,6 +28,12 @@ from app.cloud.aws.client import get_aws_client_factory
 from app.models.actions import ActionLog, ActionType
 from app.models.audit_log import AuditLog, AuditStatus
 from app.models.resource import Resource, ResourceStatus, ResourceType
+from app.safety.guardrails import (
+    create_ebs_rollback_snapshot,
+    record_execution_outcome,
+    rollback_required_for_delete,
+    validate_before_execution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +122,61 @@ class AWSExecutor:
                 dry_run=self.dry_run,
             )
 
+        safety = validate_before_execution(
+            db,
+            resource,
+            action_type,
+            dry_run=self.dry_run,
+            skip_rollback_check=rollback_required_for_delete(resource, action_type),
+        )
+        if not safety.allowed:
+            error_msg = "; ".join(safety.reasons)
+            logger.error(f"Safety validation failed: {error_msg}")
+            record_execution_outcome(success=False)
+            return ExecutionResult(
+                status=ExecutionStatus.FAILED,
+                attempt=0,
+                message=error_msg,
+                error=error_msg,
+                dry_run=self.dry_run,
+            )
+
+        rollback_snapshot_id: str | None = None
+        if rollback_required_for_delete(resource, action_type) and not self.dry_run:
+            try:
+                rollback_snapshot_id = create_ebs_rollback_snapshot(
+                    resource, self.client_factory
+                )
+            except Exception as e:
+                error_msg = f"Rollback snapshot failed: {e}"
+                logger.error(error_msg)
+                record_execution_outcome(success=False)
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    attempt=0,
+                    message=error_msg,
+                    error=error_msg,
+                    dry_run=self.dry_run,
+                )
+            safety = validate_before_execution(
+                db,
+                resource,
+                action_type,
+                rollback_snapshot_id=rollback_snapshot_id,
+                dry_run=self.dry_run,
+            )
+            if not safety.allowed:
+                error_msg = "; ".join(safety.reasons)
+                logger.error(f"Safety validation failed after snapshot: {error_msg}")
+                record_execution_outcome(success=False)
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    attempt=0,
+                    message=error_msg,
+                    error=error_msg,
+                    dry_run=self.dry_run,
+                )
+
         # Create audit log entry
         audit_log = AuditLog(
             resource_id=resource.id,
@@ -202,6 +263,14 @@ class AWSExecutor:
         logger.info(
             f"Execution completed: {action_type} - {result.status if result else 'UNKNOWN'}"
         )
+
+        if result:
+            record_execution_outcome(
+                success=result.status
+                in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN),
+            )
+        else:
+            record_execution_outcome(success=False)
 
         # Set audit log ID in result
         if result:

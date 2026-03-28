@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,7 @@ from app.services.cost_engine import CostEngine
 from app.services.decision_engine import DecisionEngine
 from app.services.inference_queue import InferenceQueueService
 from app.services.optimizer import Optimizer
+from app.system_health.monitor import automation_may_run, record_inference_duration
 
 settings = get_settings()
 
@@ -118,34 +120,37 @@ class MetricOrchestrator:
                 inference_job_id=job_id,
             )
 
-        anomaly_result = self.anomaly_detector.detect(resource, payload, estimated_cost)
-        action_name = None
-        action_status = None
+        t_inf = perf_counter()
+        try:
+            anomaly_result = self.anomaly_detector.detect(resource, payload, estimated_cost)
+            action_name = None
+            action_status = None
 
-        if anomaly_result.is_anomaly:
-            self.anomaly_repo.create(
-                Anomaly(
-                    resource_id=payload.resource_id,
-                    timestamp=payload.timestamp,
-                    anomaly_score=anomaly_result.score,
-                    reason=anomaly_result.reason,
-                    detection_source=anomaly_result.detection_source,
-                    expected_cost=anomaly_result.expected_cost,
-                    actual_cost=anomaly_result.actual_cost,
-                    shap_contributions=anomaly_result.shap_contributions,
+            if anomaly_result.is_anomaly:
+                self.anomaly_repo.create(
+                    Anomaly(
+                        resource_id=payload.resource_id,
+                        timestamp=payload.timestamp,
+                        anomaly_score=anomaly_result.score,
+                        reason=anomaly_result.reason,
+                        detection_source=anomaly_result.detection_source,
+                        expected_cost=anomaly_result.expected_cost,
+                        actual_cost=anomaly_result.actual_cost,
+                        shap_contributions=anomaly_result.shap_contributions,
+                    )
                 )
-            )
 
-        decision = self.decision_engine.evaluate(resource, payload, estimated_cost, anomaly_result)
-        if decision.should_act and decision.action_type and settings.auto_apply_optimizations:
-            action_log, action_status = self.optimizer.execute(
-                resource=resource,
-                action_type=decision.action_type,
-                estimated_savings=decision.estimated_savings,
-                dry_run=settings.dry_run_optimizations,
-            )
-            action_name = action_log.action_type.value
-
+            decision = self.decision_engine.evaluate(resource, payload, estimated_cost, anomaly_result)
+            if decision.should_act and decision.action_type and automation_may_run(self.db):
+                action_log, action_status = self.optimizer.execute(
+                    resource=resource,
+                    action_type=decision.action_type,
+                    estimated_savings=decision.estimated_savings,
+                    dry_run=settings.dry_run_optimizations,
+                )
+                action_name = action_log.action_type.value
+        finally:
+            record_inference_duration(perf_counter() - t_inf)
         self.db.commit()
         logger.info(
             "Processed metric=%s resource=%s anomaly=%s action=%s",

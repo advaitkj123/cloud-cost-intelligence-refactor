@@ -37,6 +37,12 @@ class AWSClientFactory:
     def ec2(self, region_name: str | None = None) -> BaseClient:
         return self.client("ec2", region_name=region_name)
 
+    def s3(self, region_name: str | None = None) -> BaseClient:
+        return self.client("s3", region_name=region_name)
+
+    def lambda_client(self, region_name: str | None = None) -> BaseClient:
+        return self.client("lambda", region_name=region_name)
+
     def cloudwatch(self, region_name: str | None = None) -> BaseClient:
         return self.client("cloudwatch", region_name=region_name)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import perf_counter
 from uuid import uuid4
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,6 +19,7 @@ from app.services.anomaly_detector import AnomalyDetector
 from app.services.decision_engine import DecisionEngine
 from app.services.optimizer import Optimizer
 from app.services.shap_explainer import ShapExplainer
+from app.system_health.monitor import automation_may_run, record_inference_duration
 
 settings = get_settings()
 _inference_scheduler = BackgroundScheduler(timezone="UTC")
@@ -66,6 +68,7 @@ def shutdown_inference_scheduler() -> None:
 
 def _process_inference_job(*, resource_id: int, metric_id: int, cost_record_id: int) -> None:
     db = SessionLocal()
+    t0 = perf_counter()
     try:
         resource_repo = ResourceRepository(db)
         metric_repo = MetricRepository(db)
@@ -102,7 +105,7 @@ def _process_inference_job(*, resource_id: int, metric_id: int, cost_record_id: 
             )
 
         decision = DecisionEngine().evaluate(resource, metric_record, cost_record.estimated_cost, result)
-        if decision.should_act and decision.action_type and settings.auto_apply_optimizations:
+        if decision.should_act and decision.action_type and automation_may_run(db):
             Optimizer(action_repo).execute(
                 resource=resource,
                 action_type=decision.action_type,
@@ -114,4 +117,5 @@ def _process_inference_job(*, resource_id: int, metric_id: int, cost_record_id: 
         db.rollback()
         logger.exception("Async inference job failed for metric %s: %s", metric_id, exc)
     finally:
+        record_inference_duration(perf_counter() - t0)
         db.close()

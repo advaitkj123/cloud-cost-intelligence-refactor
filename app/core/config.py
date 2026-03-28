@@ -68,6 +68,26 @@ class Settings(BaseSettings):
     inference_scheduler_enabled: bool = True
     inference_job_misfire_grace_seconds: int = 30
 
+    # Safety / guardrails (see app.safety.guardrails)
+    safety_cooldown_seconds: int = 3600
+    safety_circuit_failure_threshold: int = 5
+    safety_circuit_window_seconds: int = 300
+
+    # System health (see app.system_health.monitor)
+    health_pipeline_latency_warn_seconds: float = 120.0
+    health_pipeline_latency_critical_seconds: float = 300.0
+    health_pipeline_stale_seconds: float = 600.0
+    health_inference_warn_seconds: float = 15.0
+    health_inference_critical_seconds: float = 60.0
+    health_execution_success_rate_min: float = 0.75
+    health_execution_min_samples: int = 5
+    health_execution_lookback_hours: int = 24
+    health_missing_data_stale_hours: int = 2
+    health_missing_data_max_ratio: float = 0.25
+    health_eval_cache_seconds: float = 45.0
+
+    unified_pipeline_interval_seconds: int = 90
+
 
 @lru_cache
 def get_settings() -> Settings:
